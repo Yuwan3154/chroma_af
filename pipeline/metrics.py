@@ -2,6 +2,9 @@
 Metrics computation for the Chroma + OpenFold pipeline.
 """
 
+import re
+import subprocess
+import tempfile
 from typing import Optional
 
 import numpy as np
@@ -24,12 +27,53 @@ def entropy(C: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return -(C * C.log()).sum(dim=dim)
 
 
+def compute_tm_score(
+    pred_path: str,
+    ref_path: str,
+    usalign_binary: str = "USalign",
+) -> Optional[float]:
+    """
+    Compute TM-score between predicted and reference structure using USalign.
+
+    Args:
+        pred_path: Path to predicted structure (PDB or CIF).
+        ref_path: Path to reference/ground-truth structure (PDB or CIF).
+        usalign_binary: Path to USalign executable.
+
+    Returns:
+        TM-score (0-1) normalized by reference length, or None if USalign fails.
+    """
+    try:
+        result = subprocess.run(
+            [usalign_binary, pred_path, ref_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return None
+        # Parse: TM-score= 0.41854 (normalized by length of Structure_2: L=82, d0=3.24)
+        # Use the one normalized by Structure_2 (reference)
+        match = re.search(
+            r"TM-score=\s*([\d.]+)\s*\(normalized by length of Structure_2:",
+            result.stdout,
+        )
+        if match:
+            return float(match.group(1))
+        # Fallback: first TM-score line
+        match = re.search(r"TM-score=\s*([\d.]+)", result.stdout)
+        return float(match.group(1)) if match else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        return None
+
+
 def compute_iteration_metrics(
     af_pdb_path: str,
     gt_pdb_path: str,
     num_resi: int,
     openfold_output: dict,
     device: torch.device,
+    usalign_binary: str = "USalign",
 ) -> dict:
     """
     Compute metrics for one iteration: dist_diff, plddt, pae, cmap_ent.
@@ -42,25 +86,33 @@ def compute_iteration_metrics(
         device: Torch device
 
     Returns:
-        Dict with dist_diff, plddt_mean, pae_mean, cmap_ent_mean, mpnn_ce_mean, mpnn_ent_mean.
+        Dict with dist_diff, plddt_mean, pae_mean, cmap_ent_mean, tm_score, mpnn_ce_mean, mpnn_ent_mean.
         mpnn_ce_mean and mpnn_ent_mean are None (not implemented).
     """
-    from chroma import Protein
+    # Lazy import Chroma (may not be installed in Proteina-only env)
+    try:
+        from chroma import Protein
+    except ImportError:
+        Protein = None
 
     def _load_protein(path: str):
+        if Protein is None:
+            raise ImportError("Chroma is required for compute_iteration_metrics (dist_diff)")
         return Protein.from_CIF(path) if path.lower().endswith(".cif") else Protein.from_PDB(path)
 
-    # Load structures
-    gt_protein = _load_protein(gt_pdb_path)
-    af_protein = _load_protein(af_pdb_path)
+    # TM-score (USalign)
+    tm_score = compute_tm_score(af_pdb_path, gt_pdb_path, usalign_binary=usalign_binary)
 
-    gt_X = gt_protein.to_XCS()[0][:, :num_resi]
-    af_X = af_protein.to_XCS()[0]
-
-    gt_dist = pair_wise_distance_ca(gt_X)
-    af_dist = pair_wise_distance_ca(af_X)
-
-    mean_dist_diff = (af_dist - gt_dist).abs().mean().item()
+    # dist_diff (requires Chroma; None if not available)
+    mean_dist_diff = None
+    if Protein is not None:
+        gt_protein = _load_protein(gt_pdb_path)
+        af_protein = _load_protein(af_pdb_path)
+        gt_X = gt_protein.to_XCS()[0][:, :num_resi]
+        af_X = af_protein.to_XCS()[0]
+        gt_dist = pair_wise_distance_ca(gt_X)
+        af_dist = pair_wise_distance_ca(af_X)
+        mean_dist_diff = (af_dist - gt_dist).abs().mean().item()
 
     # pLDDT from OpenFold output
     plddt = openfold_output.get("plddt")
@@ -97,14 +149,18 @@ def compute_iteration_metrics(
         "plddt_mean": plddt_mean,
         "pae_mean": pae_mean,
         "cmap_ent_mean": cmap_ent_mean,
+        "tm_score": tm_score,
         "mpnn_ce_mean": mpnn_ce_mean,
         "mpnn_ent_mean": mpnn_ent_mean,
     }
 
 
-def compute_af_chroma_dist_diff(af_pdb_path: str, chroma_pdb_path: str) -> float:
-    """Distance difference between AF and Chroma structures (debug metric)."""
-    from chroma import Protein
+def compute_af_chroma_dist_diff(af_pdb_path: str, chroma_pdb_path: str) -> Optional[float]:
+    """Distance difference between AF and Chroma structures (debug metric). Returns None if Chroma not available."""
+    try:
+        from chroma import Protein
+    except ImportError:
+        return None
 
     def _load_protein(path: str):
         return Protein.from_CIF(path) if path.lower().endswith(".cif") else Protein.from_PDB(path)

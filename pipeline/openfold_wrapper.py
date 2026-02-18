@@ -12,20 +12,63 @@ For full_template with PDB input:
 
 import logging
 import os
+import sys
 import tempfile
+import urllib.request
 from typing import Optional, Tuple
 
+import gemmi
 import numpy as np
 import torch
 
+from openfold.data import mmcif_parsing
 from openfold.np import protein
 from openfold.np import residue_constants as rc
+
+# Ensure proteina is on path for OpenFoldTemplateInference
+_PROTEINA_PATH = "/home/ubuntu/proteina"
+if _PROTEINA_PATH not in sys.path:
+    sys.path.insert(0, _PROTEINA_PATH)
+
+from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
+
+
+def create_openfold_inference(
+    model_name: str = "model_1_ptm",
+    jax_params_path: str = "/home/ubuntu/params/params_model_1_ptm.npz",
+    device: Optional[torch.device] = None,
+    max_recycling_iters: int = 3,
+    template_sequence_all_x: bool = False,
+    skip_template_alignment: bool = True,
+    compile_model: bool = False,
+) -> OpenFoldTemplateInference:
+    """
+    Create and return an OpenFoldTemplateInference instance for reuse across runs.
+
+    Call once per experiment (or per PDB) and pass the returned instance to
+    run_openfold_on_pdb via the infer argument to avoid reloading weights each iteration.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise ValueError("OpenFold requires CUDA")
+
+    infer = OpenFoldTemplateInference(
+        model_name=model_name,
+        jax_params_path=jax_params_path,
+        device=device,
+        max_recycling_iters=max_recycling_iters,
+        template_sequence_all_x=template_sequence_all_x,
+        skip_template_alignment=skip_template_alignment,
+    )
+    if compile_model and hasattr(torch, "compile"):
+        infer.model = torch.compile(infer.model, mode="reduce-overhead")
+        logging.getLogger(__name__).info("OpenFold model compiled with torch.compile")
+    return infer
 
 
 def _fetch_mmcif_from_rcsb(pdb_id: str) -> str:
     """Fetch mmCIF from RCSB for a known PDB ID. Returns path to temp file."""
-    import urllib.request
-
     url = f"https://files.rcsb.org/download/{pdb_id.lower()}.cif"
     fd, cif_path = tempfile.mkstemp(suffix=".cif")
     os.close(fd)
@@ -41,8 +84,6 @@ def _pdb_to_mmcif(pdb_path: str, chain_id: str = "A") -> Optional[str]:
     - Otherwise try gemmi conversion (requires gemmi package).
     - Returns path to mmCIF file, or None if conversion fails.
     """
-    import logging
-
     stem = os.path.splitext(os.path.basename(pdb_path))[0]
     # Check if it's a standard PDB ID (4 alphanumeric)
     if len(stem) == 4 and stem.isalnum():
@@ -112,6 +153,34 @@ def _protein_from_atom37(
     )
 
 
+def _get_label_to_auth_chain_mapping(cif_path: str) -> dict[str, str]:
+    """
+    Build label_asym_id -> auth_asym_id mapping from mmCIF.
+
+    Standard CIF chain assignment uses label_asym_id (A, B, C...).
+    Gemmi and PDB use auth_asym_id for chain names.
+    """
+    try:
+        doc = gemmi.cif.read_file(cif_path)
+        block = doc.sole_block()
+        cat = block.get_mmcif_category("_atom_site")
+        labels = cat.get("label_asym_id", [])
+        auths = cat.get("auth_asym_id", [])
+        if not labels or not auths:
+            # Fallback: struct_asym (pdbx_blank_PDB_chainid_flag)
+            cat = block.get_mmcif_category("_struct_asym")
+            ids = cat.get("id", [])
+            auths = cat.get("pdbx_blank_PDB_chainid_flag", [])
+            labels = ids
+        if isinstance(labels, str):
+            labels = [labels]
+        if isinstance(auths, str):
+            auths = [auths]
+        return dict(zip(labels, auths))
+    except Exception:
+        return {}
+
+
 def load_pdb_for_openfold(
     pdb_path: str,
     chain_id: str = "A",
@@ -134,15 +203,32 @@ def load_pdb_for_openfold(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    effective_chain_id = chain_id
     if pdb_path.lower().endswith(".cif"):
-        import gemmi
+        # Resolve standard (label_asym_id) to author (auth) chain for mmCIF
+        # af2rank and similar use standard chain assignment (label_asym_id)
+        label_to_auth = _get_label_to_auth_chain_mapping(pdb_path)
+        if chain_id is not None and chain_id in label_to_auth:
+            effective_chain_id = label_to_auth[chain_id]
 
         s = gemmi.read_structure(pdb_path)
         if chain_id is not None:
             for model in s:
-                for c in list(model):
-                    if c.name != chain_id:
-                        model.remove_chain(c.name)
+                chain_names = [c.name for c in model]
+                target = effective_chain_id
+                if target in chain_names:
+                    for c in list(model):
+                        if c.name != target:
+                            model.remove_chain(c.name)
+                elif chain_names:
+                    logging.getLogger(__name__).warning(
+                        "Chain %s (auth %s) not found in %s (has %s), using %s",
+                        chain_id, effective_chain_id, pdb_path, chain_names, chain_names[0],
+                    )
+                    effective_chain_id = chain_names[0]
+                    for c in list(model):
+                        if c.name != effective_chain_id:
+                            model.remove_chain(c.name)
         fd, tmp_pdb = tempfile.mkstemp(suffix=".pdb")
         os.close(fd)
         try:
@@ -158,7 +244,7 @@ def load_pdb_for_openfold(
         with open(pdb_path, "r") as f:
             pdb_str = f.read()
 
-    prot = protein.from_pdb_string(pdb_str, chain_id=chain_id)
+    prot = protein.from_pdb_string(pdb_str, chain_id=effective_chain_id)
     keep = prot.aatype != rc.restype_num
     aatype = prot.aatype[keep]
     atom_positions = prot.atom_positions[keep]
@@ -204,6 +290,7 @@ def run_openfold_on_pdb(
     template_sequence_all_x: bool = False,
     query_sequence_path: Optional[str] = None,
     skip_template_alignment: bool = True,
+    infer: Optional[OpenFoldTemplateInference] = None,
 ) -> dict:
     """
     Run OpenFold (monomer) on a PDB and save result.
@@ -215,6 +302,8 @@ def run_openfold_on_pdb(
         template_sequence_all_x: If True, mask template sequence to all X (restype 20).
         query_sequence_path: Path to ground-truth PDB/CIF for query sequence. If None, uses template.
         skip_template_alignment: If True, use 1:1 mapping (template same length as query).
+        infer: Optional pre-created OpenFoldTemplateInference instance. If provided, reuse it
+            instead of creating a new one (avoids reloading weights each call).
 
     Returns:
         dict with keys: final_atom_positions, plddt, predicted_aligned_error (if PTM),
@@ -226,14 +315,6 @@ def run_openfold_on_pdb(
         raise ValueError("OpenFold requires CUDA")
     if template_mode == "full_template" and not kalign_binary_path:
         raise ValueError("kalign_binary_path is required for template_mode=full_template")
-
-    # Add proteina to path for OpenFoldTemplateInference
-    import sys
-    proteina_path = "/home/ubuntu/proteina"
-    if proteina_path not in sys.path:
-        sys.path.insert(0, proteina_path)
-
-    from proteinfoundation.utils.openfold_inference import OpenFoldTemplateInference
 
     (
         distogram_probs,
@@ -264,17 +345,16 @@ def run_openfold_on_pdb(
         residue_type = gt_residue_type
         aatype = gt_aatype
 
-    infer = OpenFoldTemplateInference(
-        model_name=model_name,
-        jax_params_path=jax_params_path,
-        device=device,
-        max_recycling_iters=3,
-        template_sequence_all_x=template_sequence_all_x,
-        skip_template_alignment=skip_template_alignment,
-    )
-    if compile_model and hasattr(torch, "compile"):
-        infer.model = torch.compile(infer.model, mode="reduce-overhead")
-        logging.getLogger(__name__).info("OpenFold model compiled with torch.compile")
+    if infer is None:
+        infer = create_openfold_inference(
+            model_name=model_name,
+            jax_params_path=jax_params_path,
+            device=device,
+            max_recycling_iters=3,
+            template_sequence_all_x=template_sequence_all_x,
+            skip_template_alignment=skip_template_alignment,
+            compile_model=compile_model,
+        )
 
     template_mmcif_path = None
     temp_cif_path = None
@@ -286,7 +366,6 @@ def run_openfold_on_pdb(
             temp_cif_path = _pdb_to_mmcif(pdb_path, chain_id=chain_id)
             if temp_cif_path:
                 # Verify OpenFold can parse it
-                from openfold.data import mmcif_parsing
                 with open(temp_cif_path) as f:
                     parse_result = mmcif_parsing.parse(
                         file_id="template", mmcif_string=f.read()

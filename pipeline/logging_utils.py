@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
-METRIC_KEYS = ["dist_diff", "plddt_mean", "pae_mean", "cmap_ent_mean", "mpnn_ce_mean", "mpnn_ent_mean"]
+METRIC_KEYS = ["dist_diff", "plddt_mean", "pae_mean", "cmap_ent_mean", "tm_score", "mpnn_ce_mean", "mpnn_ent_mean"]
 BEST_CRITERIA = ["mean_plddt", "dist_diff"]  # mpnn_ce, mpnn_ent omitted (not implemented)
 
 
@@ -50,7 +50,9 @@ def update_best(
     best[criterion] = {"exp": int, "iter": int, "path": str, "metrics": dict}
     """
     plddt = metrics.get("plddt_mean") or 0.0
-    dist_diff = metrics.get("dist_diff") or float("inf")
+    dist_diff = metrics.get("dist_diff")
+    if dist_diff is None:
+        dist_diff = float("inf")
     mpnn_ce = metrics.get("mpnn_ce_mean")
     mpnn_ent = metrics.get("mpnn_ent_mean")
 
@@ -121,11 +123,12 @@ def log_best(best: Dict[str, Optional[dict]]) -> None:
             continue
         m = entry["metrics"]
         logger.info(
-            "%s: best_exp=%s best_iter=%s path=%s dist_diff=%.3g plddt_mean=%.3g",
+            "%s: best_exp=%s best_iter=%s path=%s dist_diff=%.3g plddt_mean=%.3g tm_score=%.3g",
             criterion,
             entry["exp"],
             entry["iter"],
             entry["path"],
             m.get("dist_diff", 0),
             m.get("plddt_mean", 0),
+            m.get("tm_score", 0),
         )

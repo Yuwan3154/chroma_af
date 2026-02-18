@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -25,13 +26,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "chroma"))
 
-# Chroma API key
-from chroma import api
-api.register_key("10e48bde5ef449e3bcee003bf12d5b59")
-from chroma import Chroma, Protein, conditioners
-
-from pipeline.openfold_wrapper import load_pdb_for_openfold, run_openfold_on_pdb
+from pipeline.openfold_wrapper import (
+    create_openfold_inference,
+    load_pdb_for_openfold,
+    run_openfold_on_pdb,
+)
 from pipeline.metrics import compute_iteration_metrics, compute_af_chroma_dist_diff
+from pipeline.proteina_wrapper import build_contig_from_plddt_mask
+from pipeline.structure_utils import cif_to_pdb
 from pipeline.logging_utils import (
     append_metrics,
     update_best,
@@ -83,8 +85,6 @@ def load_af2rank_lookup(
     then natives_rcsb. Ground-truth path: pdb_root/{mid2}/{pdbid}.cif
     where mid2 = middle two chars of 4-char pdb code (e.g. 1r6j -> r6).
     """
-    import csv
-
     lookup = {}
     with open(csv_path) as f:
         reader = csv.DictReader(f)
@@ -231,6 +231,31 @@ def main():
         action="store_true",
         help="Resume from last checkpoint. Skips completed experiments/iterations.",
     )
+    parser.add_argument(
+        "--scaffold_backend",
+        type=str,
+        default="chroma",
+        choices=["chroma", "proteina"],
+        help="Backend for motif scaffolding: chroma (default) or proteina.",
+    )
+    parser.add_argument(
+        "--proteina_ckpt_path",
+        type=str,
+        default="/path/to/proteina/checkpoint",
+        help="Path to Proteina motif-scaffolding checkpoint directory. User must set when using --scaffold_backend proteina.",
+    )
+    parser.add_argument(
+        "--proteina_config",
+        type=str,
+        default=None,
+        help="Optional path to Proteina inference config YAML. Uses defaults if not set.",
+    )
+    parser.add_argument(
+        "--usalign_binary",
+        type=str,
+        default="USalign",
+        help="Path to USalign executable for TM-score computation.",
+    )
     args = parser.parse_args()
 
     if args.template_mode == "full_template" and not args.kalign_binary_path:
@@ -301,19 +326,42 @@ def main():
                 start_iter = 0
                 tem_fname = init_fname
 
-            # Schedules
+            # Schedules (plddt normalized to 0-1 for cutoff comparison)
             plddt_cutoff_schedule = np.linspace(0.6, 0.7, args.num_iterations)
             temperature_schedule = np.linspace(8, 8, args.num_iterations)
             noise_schedule = np.linspace(8, 0, args.num_iterations)
             tspan = (0.1, 0.9)
 
-            # Chroma model (one per experiment)
-            chroma = Chroma(device=device)
-            if args.compile_chroma and hasattr(torch, "compile"):
-                chroma.backbone_network = torch.compile(
-                    chroma.backbone_network, mode="reduce-overhead"
+            # Scaffold model (one per experiment)
+            chroma = None
+            proteina_model = None
+            need_chroma_for_init = start_iter == 0
+            if args.scaffold_backend == "chroma" or need_chroma_for_init:
+                from chroma import api
+                api.register_key("10e48bde5ef449e3bcee003bf12d5b59")
+                from chroma import Chroma
+                chroma = Chroma(device=device)
+                if args.compile_chroma and hasattr(torch, "compile"):
+                    chroma.backbone_network = torch.compile(
+                        chroma.backbone_network, mode="reduce-overhead"
+                    )
+                    logger.info("Chroma backbone compiled with torch.compile")
+            if args.scaffold_backend == "proteina":
+                from pipeline.proteina_wrapper import create_proteina_inference
+                proteina_model = create_proteina_inference(
+                    ckpt_path=args.proteina_ckpt_path,
+                    device=device,
+                    config_path=args.proteina_config,
                 )
-                logger.info("Chroma backbone compiled with torch.compile")
+
+            # OpenFold inference (one per experiment, cached across iterations)
+            openfold_infer = create_openfold_inference(
+                jax_params_path=args.jax_params,
+                device=device,
+                template_sequence_all_x=args.template_sequence_all_x,
+                skip_template_alignment=True,
+                compile_model=args.compile_openfold,
+            )
 
             # Initial structure (only if not resuming from iter > 0)
             # Regenerate init if it has wrong length (stale from multi-chain bug)
@@ -325,7 +373,7 @@ def main():
                     logger.warning("Regenerating init.pdb: had %d residues, need %d", rt_init.shape[1], num_resi)
                     os.remove(init_fname)
             if start_iter == 0 and not os.path.exists(init_fname):
-                protein_init = chroma.sample(chain_lengths=[num_resi], design_method=None)
+                protein_init = chroma.sample(chain_lengths=[num_resi], steps=400, design_method=None)
                 protein_init.to(init_fname)
 
             # Load existing metrics when resuming
@@ -351,10 +399,10 @@ def main():
                     jax_params_path=args.jax_params,
                     template_mode=args.template_mode,
                     kalign_binary_path=args.kalign_binary_path,
-                    compile_model=args.compile_openfold,
                     template_sequence_all_x=args.template_sequence_all_x,
                     query_sequence_path=gt_fname,
                     skip_template_alignment=True,
+                    infer=openfold_infer,
                 )
                 tem_fname = af_out_path
 
@@ -365,76 +413,110 @@ def main():
                     num_resi=num_resi,
                     openfold_output=of_result,
                     device=device,
+                    usalign_binary=args.usalign_binary,
                 )
                 iter_metrics["iter"] = i
                 iter_metrics["exp"] = exp_num
                 iter_metrics["pdb_id"] = pdb_id
 
-                # --- Chroma ---
+                # --- Motif scaffolding (Chroma or Proteina) or skip if all high-conf ---
+                if i == 0 and exp_num == 0:
+                    logger.info("of_result keys: %s", list(of_result.keys()))
                 plddt = of_result.get("plddt")
                 if plddt is not None:
-                    plddt_t = plddt.detach().cpu()
+                    # OpenFold returns 0-100; normalize to 0-1
+                    plddt_t = (plddt.detach().cpu().squeeze() / 100.0).clamp(0.0, 1.0)
                 else:
-                    plddt_t = torch.ones(num_resi) * 70.0
+                    # Do not assume high confidence when plddt missing; run Chroma
+                    plddt_t = torch.zeros(num_resi)
 
                 plddt_cutoff = plddt_cutoff_schedule[i]
-                selection_str = "all"
-                protein_af = (
-                    Protein.from_CIF(tem_fname)
-                    if tem_fname.lower().endswith(".cif")
-                    else Protein.from_PDB(tem_fname)
-                )
                 if plddt_t.max() > plddt_cutoff:
                     plddt_cutoff = min(
                         plddt_cutoff,
                         float(torch.quantile(plddt_t, 0.25, interpolation="linear")),
                     )
-                    mask = (plddt_t > plddt_cutoff).bool()
-                    high_conf_indices = mask.nonzero(as_tuple=True)[0].tolist()
+                mask = (plddt_t > plddt_cutoff).bool()
+                high_conf_indices = mask.nonzero(as_tuple=True)[0].tolist()
+                all_high_conf = len(high_conf_indices) == num_resi
+
+                ch_out_path = os.path.join(save_dir, f"{exp_name}_ch_{i:03d}.pdb")
+
+                if all_high_conf:
+                    mean_plddt_val = float(plddt_t.mean()) if plddt is not None else 0.0
+                    logger.info("Skipping Chroma (all_high_conf): mean_plddt=%.2f cutoff=%.2f", mean_plddt_val, plddt_cutoff)
+                    # Skip sampling: use OpenFold output directly (gemmi for CIF->PDB, no Chroma)
+                    if tem_fname.lower().endswith(".cif"):
+                        cif_to_pdb(tem_fname, ch_out_path, chain_id=chain)
+                    else:
+                        import shutil
+                        shutil.copy(tem_fname, ch_out_path)
+                    tem_fname = ch_out_path
+                elif args.scaffold_backend == "chroma":
+                    from chroma import Protein, conditioners
+                    selection_str = "all"
+                    protein_af = (
+                        Protein.from_CIF(tem_fname)
+                        if tem_fname.lower().endswith(".cif")
+                        else Protein.from_PDB(tem_fname)
+                    )
                     if high_conf_indices:
                         protein_af.sys.save_selection(
                             gti=high_conf_indices, selname="plddt_mask"
                         )
                         selection_str = "namesel plddt_mask"
-                substructure_conditioner = conditioners.SubstructureConditioner(
-                    protein_af,
-                    backbone_model=chroma.backbone_network,
-                    selection=selection_str,
-                    tspan=tspan,
-                ).to(device)
+                    substructure_conditioner = conditioners.SubstructureConditioner(
+                        protein_af,
+                        backbone_model=chroma.backbone_network,
+                        selection=selection_str,
+                        tspan=tspan,
+                    ).to(device)
+                    temperature = float(temperature_schedule[i])
+                    noise = float(noise_schedule[i])
+                    protein_ch = chroma.sample(
+                        chain_lengths=[num_resi],
+                        initialize_noise=True,
+                        conditioner=substructure_conditioner,
+                        langevin_factor=noise,
+                        langevin_isothermal=True,
+                        inverse_temperature=temperature,
+                        sde_func="langevin",
+                        steps=400,
+                        design_method=None,
+                    )
+                    protein_ch.to(ch_out_path)
+                    tem_fname = ch_out_path
+                elif args.scaffold_backend == "proteina":
+                    from pipeline.proteina_wrapper import run_proteina_motif_scaffolding
+                    contig_string = build_contig_from_plddt_mask(
+                        high_conf_indices, num_resi, chain_id=chain
+                    )
+                    run_proteina_motif_scaffolding(
+                        proteina_model,
+                        motif_pdb_path=tem_fname,
+                        contig_string=contig_string,
+                        output_path=ch_out_path,
+                        num_resi=num_resi,
+                        chain_id=chain,
+                        motif_only=False,
+                    )
+                    tem_fname = ch_out_path
 
-                temperature = float(temperature_schedule[i])
-                noise = float(noise_schedule[i])
-                protein_ch = chroma.sample(
-                    chain_lengths=[num_resi],
-                    initialize_noise=True,
-                    conditioner=substructure_conditioner,
-                    langevin_factor=noise,
-                    langevin_isothermal=True,
-                    inverse_temperature=temperature,
-                    sde_func="langevin",
-                    steps=400,
-                    design_method=None,
-                )
-                ch_out_path = os.path.join(save_dir, f"{exp_name}_ch_{i:03d}.pdb")
-                protein_ch.to(ch_out_path)
-                tem_fname = ch_out_path
-
-                # AF-Chroma dist diff
-                iter_metrics["af_chroma_dist_diff"] = compute_af_chroma_dist_diff(
-                    af_out_path, ch_out_path
-                )
+                # AF-Chroma dist diff (None if Chroma not available)
+                af_chroma_diff = compute_af_chroma_dist_diff(af_out_path, ch_out_path)
+                iter_metrics["af_chroma_dist_diff"] = af_chroma_diff if af_chroma_diff is not None else 0.0
 
                 append_metrics(all_metrics, iter_metrics)
                 update_best(best, iter_metrics, exp_num, i, tem_fname)
 
                 logger.info(
-                    "Iter %d: dist_diff=%.3g plddt=%.3g pae=%.3g cmap_ent=%.3g af_chroma_diff=%.3g",
+                    "Iter %d: dist_diff=%.3g plddt=%.3g pae=%.3g cmap_ent=%.3g tm_score=%s af_chroma_diff=%.3g",
                     i,
                     iter_metrics["dist_diff"],
                     iter_metrics["plddt_mean"],
                     iter_metrics["pae_mean"],
                     iter_metrics["cmap_ent_mean"],
+                    iter_metrics.get("tm_score"),
                     iter_metrics["af_chroma_dist_diff"],
                 )
 
