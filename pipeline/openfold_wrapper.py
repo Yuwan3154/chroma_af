@@ -38,7 +38,7 @@ def create_openfold_inference(
     jax_params_path: str = "/home/ubuntu/params/params_model_1_ptm.npz",
     device: Optional[torch.device] = None,
     max_recycling_iters: int = 3,
-    template_sequence_all_x: bool = False,
+    rm_template_sequence: bool = False,
     skip_template_alignment: bool = True,
     compile_model: bool = False,
 ) -> OpenFoldTemplateInference:
@@ -58,7 +58,7 @@ def create_openfold_inference(
         jax_params_path=jax_params_path,
         device=device,
         max_recycling_iters=max_recycling_iters,
-        template_sequence_all_x=template_sequence_all_x,
+        rm_template_sequence=rm_template_sequence,
         skip_template_alignment=skip_template_alignment,
     )
     if compile_model and hasattr(torch, "compile"):
@@ -287,7 +287,7 @@ def run_openfold_on_pdb(
     template_mode: str = "full_template",
     kalign_binary_path: Optional[str] = None,
     compile_model: bool = False,
-    template_sequence_all_x: bool = False,
+    rm_template_sequence: bool = False,
     query_sequence_path: Optional[str] = None,
     skip_template_alignment: bool = True,
     infer: Optional[OpenFoldTemplateInference] = None,
@@ -299,7 +299,7 @@ def run_openfold_on_pdb(
         template_mode: "full_template" (default) uses structure file as template;
             "distogram_only" uses CA-distance distogram only.
         kalign_binary_path: Required when template_mode is "full_template".
-        template_sequence_all_x: If True, mask template sequence to all X (restype 20).
+        rm_template_sequence: If True, mask template sequence to all X (restype 20).
         query_sequence_path: Path to ground-truth PDB/CIF for query sequence. If None, uses template.
         skip_template_alignment: If True, use 1:1 mapping (template same length as query).
         infer: Optional pre-created OpenFoldTemplateInference instance. If provided, reuse it
@@ -351,7 +351,7 @@ def run_openfold_on_pdb(
             jax_params_path=jax_params_path,
             device=device,
             max_recycling_iters=3,
-            template_sequence_all_x=template_sequence_all_x,
+            rm_template_sequence=rm_template_sequence,
             skip_template_alignment=skip_template_alignment,
             compile_model=compile_model,
         )

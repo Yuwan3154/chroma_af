@@ -210,7 +210,7 @@ def main():
         help="Use torch.compile on OpenFold model. May speed up inference.",
     )
     parser.add_argument(
-        "--template_sequence_all_x",
+        "--rm_template_sequence",
         action="store_true",
         help="Mask template sequence to all X (restype 20). Use when template has placeholder sequence (e.g. all A from Chroma).",
     )
@@ -358,7 +358,7 @@ def main():
             openfold_infer = create_openfold_inference(
                 jax_params_path=args.jax_params,
                 device=device,
-                template_sequence_all_x=args.template_sequence_all_x,
+                rm_template_sequence=args.rm_template_sequence,
                 skip_template_alignment=True,
                 compile_model=args.compile_openfold,
             )
@@ -399,7 +399,7 @@ def main():
                     jax_params_path=args.jax_params,
                     template_mode=args.template_mode,
                     kalign_binary_path=args.kalign_binary_path,
-                    template_sequence_all_x=args.template_sequence_all_x,
+                    rm_template_sequence=args.rm_template_sequence,
                     query_sequence_path=gt_fname,
                     skip_template_alignment=True,
                     infer=openfold_infer,
